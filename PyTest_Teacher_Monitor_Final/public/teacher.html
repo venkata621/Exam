@@ -1,11 +1,457 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Teacher Dashboard</title><link rel="stylesheet" href="/style.css"><script src="/socket.io/socket.io.js"></script></head><body><main><header><h1>Teacher Monitoring Dashboard</h1><a href="/">Student page</a></header><section id="login" class="card"><h2>Teacher login</h2><input id="user" value="teacher" placeholder="Username"><input id="pass" type="password" placeholder="Password"><button id="signin">Sign in</button><p id="loginErr" class="err"></p></section><div id="dash" class="hidden"><section class="card"><h2>Create unique exam code</h2><input id="student" placeholder="Student name"><button id="make">Generate code (one use, 24 hours)</button><pre id="codeOut"></pre></section><section class="card"><h2>Live camera preview</h2><p>Student must consent and allow camera access. Video is live only, not recorded.</p><video id="video" autoplay playsinline></video><p id="live">Waiting for student…</p></section><section class="card"><div class="row"><h2>Attempts & results</h2><button id="refresh">Refresh</button><button id="logout">Log out</button></div><div id="attempts"></div></section><section class="card hidden" id="detail"><button id="close">Close report</button><div id="report"></div></section></div></main><script>
-const $=x=>document.getElementById(x);let sock,pc;
-async function req(url,opts={}){let r=await fetch(url,{headers:{"Content-Type":"application/json"},...opts}),j=await r.json();if(!r.ok)throw Error(j.error||"Failed");return j}
-$("signin").onclick=async()=>{try{await req("/api/teacher/login",{method:"POST",body:JSON.stringify({username:$("user").value,password:$("pass").value})});$("login").classList.add("hidden");$("dash").classList.remove("hidden");load()}catch(e){$("loginErr").textContent=e.message}};
-$("make").onclick=async()=>{try{let x=await req("/api/teacher/codes",{method:"POST",body:JSON.stringify({student:$("student").value||"Student"})});$("codeOut").textContent=`EXAM CODE: ${x.code}\nExpires: ${new Date(x.expires).toLocaleString()}\nShare this code with your student.`;load()}catch(e){$("codeOut").textContent=e.message}};
-async function load(){let a=await req("/api/teacher/attempts");$("attempts").innerHTML=a.length?a.map(x=>`<div class="attempt"><span><b>${esc(x.student)}</b> · #${x.id}<br><small>${esc(x.status)} · ${new Date(x.started).toLocaleString()}</small></span><span>${x.result?x.result.correct+"/"+x.result.total+" · "+x.result.percentage+"%":""} <button data-id="${x.id}">Details / Monitor</button></span></div>`).join(""):"No attempts yet.";document.querySelectorAll("[data-id]").forEach(b=>b.onclick=()=>detail(+b.dataset.id))}
-async function detail(id){let a=await req(`/api/teacher/attempts/${id}`);$("detail").classList.remove("hidden");let h=`<h2>${esc(a.student)} — Attempt ${a.id}</h2><h3>Status: ${esc(a.status)}</h3>`;h+="<h3>Activity log</h3>"+a.logs.map(l=>`<p>${esc(l.at)} — <b>${esc(l.event)}</b>: ${esc(l.details||"")}</p>`).join("");if(a.result){h+=`<h3>Score ${a.result.correct}/${a.result.total} · ${a.result.percentage}%</h3><p>Wrong: ${a.result.wrong} · Unanswered: ${a.result.unanswered}</p><h3>Topic performance</h3>`;h+=Object.entries(a.result.stats).map(([k,v])=>`<p>${esc(k)}: ${v.correct}/${v.total} correct</p>`).join("");h+="<h3>Every answer</h3>"+a.result.review.map(q=>`<article><b>Q${q.id} · ${esc(q.topic)}</b><pre>${esc(q.question)}</pre><p>Student: ${q.chosen===null?"Unanswered":esc(q.options[q.chosen])}</p><p>Correct: ${esc(q.options[q.answer])}</p><p>${esc(q.explanation||"")}</p><hr></article>`).join("")}$("report").innerHTML=h;
-if(sock)sock.disconnect();sock=io();sock.emit("join-monitor",{attemptId:id,role:"teacher"});pc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});pc.ontrack=e=>{$("video").srcObject=e.streams[0];$("live").textContent="Live camera connected"};pc.onicecandidate=e=>e.candidate&&sock.emit("signal",{kind:"ice",data:e.candidate});sock.on("peer-ready",p=>{if(p.role==="student")$("live").textContent="Student connected; waiting for camera negotiation…"});sock.on("signal",async p=>{if(p.from!=="student")return;if(p.kind==="offer"){await pc.setRemoteDescription(p.data);let answer=await pc.createAnswer();await pc.setLocalDescription(answer);sock.emit("signal",{kind:"answer",data:answer})}if(p.kind==="ice")try{await pc.addIceCandidate(p.data)}catch{}})}
-function esc(x){return String(x??"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-$("refresh").onclick=load;$("close").onclick=()=>{$("detail").classList.add("hidden");if(sock)sock.disconnect();if(pc)pc.close();$("video").srcObject=null;$("live").textContent="Waiting for student…"};$("logout").onclick=async()=>{await fetch("/api/teacher/logout",{method:"POST"});location.reload()};
-</script></body></html>
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Teacher Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+
+<body>
+<main>
+  <header>
+    <h1>Teacher Monitoring Dashboard</h1>
+    <a href="/">Student page</a>
+  </header>
+
+  <!-- Teacher login -->
+  <section id="login" class="card">
+    <h2>Teacher Login</h2>
+    <form id="loginForm">
+      <input id="user" value="teacher"
+             placeholder="Username" autocomplete="username" required>
+      <input id="pass" type="password"
+             placeholder="Password" autocomplete="current-password" required>
+      <button id="signin" type="submit">Sign in</button>
+    </form>
+    <p id="loginErr" class="err" role="alert"></p>
+  </section>
+
+  <!-- Dashboard: shown only after successful authentication -->
+  <div id="dash" class="hidden">
+
+    <section class="card">
+      <h2>Create unique exam code</h2>
+      <input id="student" placeholder="Student name" maxlength="80">
+      <button id="make">Generate code (one use, 24 hours)</button>
+      <pre id="codeOut"></pre>
+    </section>
+
+    <section class="card">
+      <h2>Live camera preview</h2>
+      <p>
+        Student must consent and allow camera access.
+        Video is live only, not recorded.
+      </p>
+      <video id="video" autoplay playsinline></video>
+      <p id="live">Waiting for student…</p>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <h2>Attempts &amp; results</h2>
+        <button id="refresh">Refresh</button>
+        <button id="logout">Log out</button>
+      </div>
+      <div id="attempts"></div>
+    </section>
+
+    <section class="card hidden" id="detail">
+      <button id="close">Close report</button>
+      <div id="report"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+
+let sock = null;
+let pc = null;
+let currentAttempt = null;
+let loadingAttempts = false;
+
+async function req(url, opts = {}) {
+  const response = await fetch(url, {
+    credentials: "same-origin",
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      ...(opts.headers || {})
+    }
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.error || `Request failed (${response.status})`);
+  }
+
+  return data;
+}
+
+function showLogin(message = "") {
+  $("login").classList.remove("hidden");
+  $("dash").classList.add("hidden");
+  $("loginErr").textContent = message;
+}
+
+function showDashboard() {
+  $("login").classList.add("hidden");
+  $("dash").classList.remove("hidden");
+  $("loginErr").textContent = "";
+}
+
+/* Check whether a teacher session already exists. */
+async function checkLogin() {
+  try {
+    await req("/api/teacher/me");
+    showDashboard();
+    await load();
+  } catch (error) {
+    showLogin("");
+  }
+}
+
+/* Teacher sign in */
+$("loginForm").addEventListener("submit", async event => {
+  event.preventDefault();
+
+  const button = $("signin");
+  button.disabled = true;
+  button.textContent = "Signing in…";
+  $("loginErr").textContent = "";
+
+  try {
+    await req("/api/teacher/login", {
+      method: "POST",
+      body: JSON.stringify({
+        username: $("user").value.trim(),
+        password: $("pass").value
+      })
+    });
+
+    $("pass").value = "";
+    showDashboard();
+    await load();
+  } catch (error) {
+    showLogin(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Sign in";
+  }
+});
+
+/* Create one-use exam code */
+$("make").addEventListener("click", async () => {
+  const button = $("make");
+  button.disabled = true;
+  $("codeOut").textContent = "Generating code…";
+
+  try {
+    const result = await req("/api/teacher/codes", {
+      method: "POST",
+      body: JSON.stringify({
+        student: $("student").value.trim() || "Student"
+      })
+    });
+
+    $("codeOut").textContent =
+      `EXAM CODE: ${result.code}\n` +
+      `Student: ${result.student}\n` +
+      `Expires: ${new Date(result.expires).toLocaleString()}\n` +
+      "Share this code with the student.";
+
+    await load();
+  } catch (error) {
+    $("codeOut").textContent = error.message;
+    if (error.message.includes("Teacher login required")) {
+      showLogin("Your session expired. Please sign in again.");
+    }
+  } finally {
+    button.disabled = false;
+  }
+});
+
+/* Load attempts */
+async function load() {
+  if (loadingAttempts) return;
+  loadingAttempts = true;
+
+  try {
+    const attempts = await req("/api/teacher/attempts");
+    $("attempts").replaceChildren();
+
+    if (!attempts.length) {
+      $("attempts").textContent = "No attempts yet.";
+      return;
+    }
+
+    for (const attempt of attempts) {
+      const card = document.createElement("div");
+      card.className = "attempt";
+
+      const info = document.createElement("span");
+      const name = document.createElement("b");
+      name.textContent = attempt.student || "Student";
+
+      const metadata = document.createElement("small");
+      metadata.textContent =
+        ` #${attempt.id} · ${attempt.status} · ` +
+        new Date(attempt.started).toLocaleString();
+
+      info.append(name, document.createElement("br"), metadata);
+
+      const actions = document.createElement("span");
+
+      if (attempt.result) {
+        actions.append(
+          document.createTextNode(
+            `${attempt.result.correct}/${attempt.result.total} · ` +
+            `${attempt.result.percentage}% `
+          )
+        );
+      }
+
+      const detailsButton = document.createElement("button");
+      detailsButton.textContent = "Details / Monitor";
+      detailsButton.addEventListener("click", () => detail(attempt.id));
+
+      actions.append(detailsButton);
+      card.append(info, actions);
+      $("attempts").append(card);
+    }
+  } catch (error) {
+    $("attempts").textContent = error.message;
+
+    if (error.message.includes("Teacher login required")) {
+      showLogin("Your session expired. Please sign in again.");
+    }
+  } finally {
+    loadingAttempts = false;
+  }
+}
+
+/* Display report and connect to live monitoring */
+async function detail(id) {
+  try {
+    const attempt = await req(`/api/teacher/attempts/${id}`);
+    $("detail").classList.remove("hidden");
+
+    const report = $("report");
+    report.replaceChildren();
+
+    addText(report, "h2", `${attempt.student} — Attempt ${attempt.id}`);
+    addText(report, "h3", `Status: ${attempt.status}`);
+    addText(report, "h3", "Activity log");
+
+    for (const entry of attempt.logs || []) {
+      addText(
+        report,
+        "p",
+        `${entry.at} — ${entry.event}: ${entry.details || ""}`
+      );
+    }
+
+    if (attempt.result) {
+      const result = attempt.result;
+
+      addText(
+        report,
+        "h3",
+        `Score ${result.correct}/${result.total} · ${result.percentage}%`
+      );
+
+      addText(
+        report,
+        "p",
+        `Wrong: ${result.wrong} · Unanswered: ${result.unanswered}`
+      );
+
+      addText(report, "h3", "Topic performance");
+
+      for (const [topic, stats] of Object.entries(result.stats || {})) {
+        addText(report, "p", `${topic}: ${stats.correct}/${stats.total} correct`);
+      }
+
+      addText(report, "h3", "Every answer");
+
+      for (const question of result.review || []) {
+        const article = document.createElement("article");
+
+        addText(article, "b", `Q${question.id} · ${question.topic}`);
+        addText(article, "p", question.question);
+
+        const chosen = question.chosen === null
+          ? "Unanswered"
+          : (question.options[question.chosen] ?? "Unknown");
+
+        addText(article, "p", `Student: ${chosen}`);
+        addText(
+          article,
+          "p",
+          `Correct: ${question.options[question.answer] ?? "Unknown"}`
+        );
+
+        if (question.explanation) {
+          addText(article, "p", question.explanation);
+        }
+
+        article.append(document.createElement("hr"));
+        report.append(article);
+      }
+    }
+
+    connectMonitor(id);
+  } catch (error) {
+    $("live").textContent = error.message;
+
+    if (error.message.includes("Teacher login required")) {
+      showLogin("Your session expired. Please sign in again.");
+    }
+  }
+}
+
+/* Add plain text safely */
+function addText(parent, tag, text) {
+  const element = document.createElement(tag);
+  element.textContent = String(text ?? "");
+  parent.append(element);
+}
+
+/* WebRTC live camera connection */
+function connectMonitor(id) {
+  if (sock) {
+    sock.disconnect();
+    sock = null;
+  }
+
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+
+  $("video").srcObject = null;
+  $("live").textContent = "Connecting to student…";
+  currentAttempt = id;
+
+  sock = io();
+
+  pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" }
+    ]
+  });
+
+  pc.ontrack = event => {
+    $("video").srcObject = event.streams[0];
+    $("live").textContent = "Live camera connected";
+  };
+
+  pc.onicecandidate = event => {
+    if (event.candidate && sock) {
+      sock.emit("signal", {
+        kind: "ice",
+        data: event.candidate
+      });
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (!pc) return;
+
+    if (pc.connectionState === "failed") {
+      $("live").textContent =
+        "Camera connection failed. Try again or check network connectivity.";
+    } else if (pc.connectionState === "disconnected") {
+      $("live").textContent = "Camera disconnected";
+    }
+  };
+
+  sock.on("connect", () => {
+    sock.emit("join-monitor", {
+      attemptId: id,
+      role: "teacher"
+    });
+  });
+
+  sock.on("peer-ready", peer => {
+    if (peer.role === "student") {
+      $("live").textContent =
+        "Student connected. Waiting for camera negotiation…";
+    }
+  });
+
+  sock.on("signal", async packet => {
+    if (!pc || packet.from !== "student") return;
+
+    try {
+      if (packet.kind === "offer") {
+        await pc.setRemoteDescription(packet.data);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        sock.emit("signal", {
+          kind: "answer",
+          data: answer
+        });
+      } else if (packet.kind === "ice" && packet.data) {
+        await pc.addIceCandidate(packet.data);
+      }
+    } catch (error) {
+      $("live").textContent = "Camera negotiation failed.";
+      console.error("WebRTC error:", error);
+    }
+  });
+
+  sock.on("connect_error", () => {
+    $("live").textContent = "Monitoring server connection failed.";
+  });
+}
+
+/* Refresh reports */
+$("refresh").addEventListener("click", load);
+
+/* Close report and monitoring connection */
+$("close").addEventListener("click", () => {
+  $("detail").classList.add("hidden");
+
+  if (sock) {
+    sock.disconnect();
+    sock = null;
+  }
+
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+
+  currentAttempt = null;
+  $("video").srcObject = null;
+  $("live").textContent = "Waiting for student…";
+});
+
+/* Sign out */
+$("logout").addEventListener("click", async () => {
+  try {
+    await req("/api/teacher/logout", { method: "POST" });
+  } catch (error) {
+    console.error("Logout request failed:", error);
+  }
+
+  if (sock) sock.disconnect();
+  if (pc) pc.close();
+
+  location.reload();
+});
+
+/* Initialise page */
+checkLogin();
+</script>
+</body>
+</html>
