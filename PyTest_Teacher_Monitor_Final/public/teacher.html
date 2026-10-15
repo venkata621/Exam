@@ -1,726 +1,324 @@
-
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PyTest Teacher Dashboard</title>
+  <title>PyTest Student Exam</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/socket.io/socket.io.js"></script>
-
   <style>
-    #video {
-      display: block;
-      width: 100%;
-      max-width: 720px;
-      min-height: 260px;
-      max-height: 480px;
-      margin-top: 12px;
-      background: #000;
-      object-fit: contain;
-      border-radius: 10px;
-    }
-
-    #live {
-      padding: 10px;
-      border-radius: 8px;
-      overflow-wrap: anywhere;
-    }
-
-    #preview p {
-      overflow-wrap: anywhere;
-    }
-
-    .video-status {
-      margin-top: 10px;
-      padding: 12px;
-      border-radius: 8px;
-      background: rgba(128,128,128,.12);
-    }
-
-    #attempts .attempt {
-      margin: 10px 0;
-    }
-
-    #pdfMsg, #live {
-      white-space: pre-wrap;
-    }
+    #status { overflow-wrap:anywhere; }
+    #timer { font-variant-numeric:tabular-nums; }
+    .monitor-status { margin-top:10px; padding:10px; border-radius:8px; background:rgba(128,128,128,.12); overflow-wrap:anywhere; }
   </style>
 </head>
-
 <body>
 <main>
-  <header>
-    <h1>Teacher Dashboard</h1>
-    <a href="/">Student page</a>
-  </header>
-
-  <!-- TEACHER LOGIN -->
-  <section id="login" class="card">
-    <h2>Teacher Login</h2>
-    <form id="loginForm">
-      <input id="user" value="teacher" required placeholder="Username">
-      <input id="pass" type="password" required placeholder="Password">
-      <button id="signin" type="submit">Sign in</button>
-    </form>
-    <p id="loginErr" class="err"></p>
+  <header><h1>PyTest Arena</h1><span id="status">Ready</span></header>
+  <section class="card" id="gate">
+    <h2>Enter exam code</h2>
+    <input id="code" placeholder="Unique exam code" autocomplete="off">
+    <button id="start">Continue</button>
+    <p id="err" class="err"></p>
   </section>
 
-  <div id="dash" class="hidden">
+  <section class="card hidden" id="consent">
+    <h2>Camera monitoring notice</h2>
+    <p>Your teacher can view your live camera during this exam. Activity events such as tab visibility, fullscreen changes, copy/paste attempts, camera start and submission may be logged. This app does not record or save video. Your browser will show its usual camera permission and indicator.</p>
+    <label><input type="checkbox" id="agree"> I understand and consent to camera monitoring and activity logging.</label>
+    <button id="enable">Agree &amp; enable camera</button>
+    <p id="cerr" class="err"></p>
+  </section>
 
-    <!-- LOAD QUESTIONS -->
-    <section class="card">
-      <h2>1. Load questions</h2>
+  <section id="exam" class="hidden">
+    <div class="row"><b id="name"></b><b id="timer">60:00</b></div>
+    <div class="card">
+      <small>Camera monitoring is active with your consent. Your camera preview is not displayed on this exam screen.</small>
+      <div class="monitor-status"><b>Camera status: </b><span id="cameraStatus">Waiting for consent...</span></div>
+    </div>
+    <div class="card">
+      <small id="count"></small><h3 id="topic"></h3><pre id="q"></pre><div id="opts"></div>
+      <div class="row"><button id="prev">Previous</button><button id="clear">Clear</button><button id="next">Next</button></div>
+    </div>
+    <div class="card"><h3>Question palette</h3><div id="palette"></div><button id="submit">Submit exam</button></div>
+  </section>
 
-      <p>
-        Upload a text-based PDF containing numbered MCQs, options A–D,
-        and answers in a supported format. Scanned image PDFs may require OCR.
-      </p>
-
-      <form id="pdfForm">
-        <input type="file" id="pdf" accept="application/pdf,.pdf" required>
-        <button id="uploadBtn" type="submit">
-          Upload PDF &amp; extract questions
-        </button>
-      </form>
-
-      <button id="defaults" type="button">
-        Use sample questions.json instead
-      </button>
-
-      <p id="pdfMsg"></p>
-      <p id="questionCount">No question set loaded.</p>
-      <div id="preview"></div>
-    </section>
-
-    <!-- CREATE EXAM -->
-    <section class="card">
-      <h2>2. Create exam code</h2>
-
-      <label>
-        Student name
-        <input id="student" maxlength="80" placeholder="Student name">
-      </label>
-
-      <label>
-        Exam duration (minutes)
-        <input id="duration" type="number" min="1" max="300"
-               value="60" required>
-      </label>
-
-      <label>
-        Number of questions
-        <input id="questionCountInput" type="number" min="1"
-               value="20" required>
-      </label>
-
-      <button id="make">Generate one-use code (valid 24 hours)</button>
-      <pre id="codeOut"></pre>
-    </section>
-
-    <!-- ATTEMPTS -->
-    <section class="card">
-      <div class="row">
-        <h2>Attempts &amp; results</h2>
-        <button id="refresh">Refresh</button>
-        <button id="logout">Log out</button>
-      </div>
-      <div id="attempts"></div>
-    </section>
-
-    <!-- ATTEMPT DETAILS AND CAMERA -->
-    <section class="card hidden" id="detail">
-      <button id="close">Close report</button>
-
-      <div id="report"></div>
-
-      <h3>Live camera preview</h3>
-
-      <p>
-        The student must start the exam, consent to camera monitoring,
-        and allow camera access in the browser.
-      </p>
-
-      <video id="video" autoplay muted playsinline controls></video>
-
-      <div class="video-status">
-        <p id="live">Select an attempt to monitor.</p>
-      </div>
-    </section>
-  </div>
+  <section class="card hidden" id="done"><h2>Submitted</h2><p id="doneText">Your answers have been saved for your teacher.</p></section>
 </main>
 
 <script>
-"use strict";
-
+'use strict';
 const $ = id => document.getElementById(id);
-
+let aid = null;
+let monitorToken = null;
+let qs = [];
+let ans = {};
+let cur = 0;
+let left = 3600;
+let stream = null;
 let sock = null;
 let pc = null;
-let loadedCount = 0;
-let loading = false;
-let activeAttemptId = null;
+let interval = null;
+let finished = false;
+let lastHiddenAt = 0;
 let pendingIce = [];
 let remoteDescriptionReady = false;
 
-async function req(url, opts = {}) {
-  const headers = { ...(opts.headers || {}) };
-
-  if (!(opts.body instanceof FormData) && opts.body !== undefined) {
-    headers["Content-Type"] = "application/json";
-  }
-
-  const r = await fetch(url, {
-    credentials: "same-origin",
-    ...opts,
-    headers
+async function post(url, data) {
+  const response = await fetch(url, {
+    method:'POST', credentials:'same-origin',
+    headers:{ 'Content-Type':'application/json' },
+    body:JSON.stringify(data)
   });
-
-  const d = await r.json().catch(() => ({}));
-
-  if (!r.ok) {
-    throw Error(d.error || `Request failed (${r.status})`);
-  }
-
-  return d;
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw Error(result.error || `Request failed (${response.status})`);
+  return result;
 }
-
-function showLogin(msg = "") {
-  $("login").classList.remove("hidden");
-  $("dash").classList.add("hidden");
-  $("loginErr").textContent = msg;
+function log(event, details = '') {
+  if (!aid) return Promise.resolve();
+  return post(`/api/student/${aid}/log`, { event, details }).catch(error => console.warn('Activity log failed:', error));
 }
+function setCameraStatus(message) { $('cameraStatus').textContent = message; }
 
-function showDash() {
-  $("login").classList.add("hidden");
-  $("dash").classList.remove("hidden");
-}
-
-async function checkLogin() {
+$('start').onclick = async () => {
+  $('err').textContent = '';
+  $('start').disabled = true;
   try {
-    await req("/api/teacher/me");
-    showDash();
-    await refreshQuestionSet();
-    await load();
-  } catch {
-    showLogin("");
-  }
-}
-
-// LOGIN
-$("loginForm").onsubmit = async e => {
-  e.preventDefault();
-
-  $("loginErr").textContent = "";
-
-  try {
-    await req("/api/teacher/login", {
-      method: "POST",
-      body: JSON.stringify({
-        username: $("user").value.trim(),
-        password: $("pass").value
-      })
-    });
-
-    $("pass").value = "";
-    showDash();
-
-    await refreshQuestionSet();
-    await load();
-  } catch (err) {
-    showLogin(err.message);
+    const data = await post('/api/student/start', { code:$('code').value.trim() });
+    aid = data.id;
+    monitorToken = data.monitorToken;
+    qs = data.questions || [];
+    left = (Number(data.durationMinutes) || 60) * 60;
+    if (!aid || !monitorToken || !qs.length) throw Error('Exam information is incomplete. Ask the teacher to create a new code.');
+    $('timer').textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+    $('name').textContent = data.student || 'Student';
+    $('gate').classList.add('hidden');
+    $('consent').classList.remove('hidden');
+    $('status').textContent = `${data.durationMinutes} minute exam · ${qs.length} questions`;
+    setCameraStatus('Waiting for consent and camera permission...');
+  } catch (error) {
+    $('err').textContent = error.message;
+    $('start').disabled = false;
   }
 };
 
-// QUESTION SET
-async function refreshQuestionSet() {
+$('enable').onclick = async () => {
+  $('cerr').textContent = '';
+  $('enable').disabled = true;
   try {
-    const d = await req("/api/teacher/question-set");
-
-    loadedCount = Number(d.count || 0);
-
-    $("questionCount").textContent =
-      `Loaded questions: ${loadedCount}`;
-
-    $("questionCountInput").max = Math.max(1, loadedCount);
-    $("questionCountInput").value = loadedCount
-      ? loadedCount
-      : 1;
-
-    $("preview").replaceChildren();
-
-    (d.questions || []).slice(0, 5).forEach(q => {
-      const p = document.createElement("p");
-      p.textContent = `Q${q.id}. ${q.question}`;
-      $("preview").append(p);
-    });
-
-    if (loadedCount === 0) {
-      $("pdfMsg").textContent =
-        "No questions loaded. Upload a valid question PDF or select sample questions.";
-    }
-  } catch (e) {
-    $("pdfMsg").textContent = e.message;
-  }
-}
-
-// PDF UPLOAD
-$("pdfForm").onsubmit = async e => {
-  e.preventDefault();
-
-  const file = $("pdf").files[0];
-
-  if (!file) {
-    $("pdfMsg").textContent = "Choose a PDF file.";
-    return;
-  }
-
-  const fd = new FormData();
-  fd.append("pdf", file);
-
-  $("uploadBtn").disabled = true;
-  $("pdfMsg").textContent = "Reading PDF and extracting questions...";
-
-  try {
-    const r = await fetch("/api/teacher/upload-pdf", {
-      method: "POST",
-      credentials: "same-origin",
-      body: fd
-    });
-
-    const d = await r.json().catch(() => ({}));
-
-    if (!r.ok) {
-      throw Error(d.error || "PDF import failed");
-    }
-
-    loadedCount = Number(d.count || 0);
-
-    $("pdfMsg").textContent =
-      `Successfully imported ${loadedCount} questions.`;
-
-    await refreshQuestionSet();
-  } catch (err) {
-    $("pdfMsg").textContent = err.message;
-  } finally {
-    $("uploadBtn").disabled = false;
+    if (!$('agree').checked) throw Error('Please accept the monitoring notice first.');
+    if (!navigator.mediaDevices?.getUserMedia) throw Error('Camera access is unavailable. Use a modern browser over HTTPS.');
+    await post(`/api/student/${aid}/consent`, { consent:true });
+    stream = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+    await log('camera_started', 'Camera enabled by browser permission');
+    $('consent').classList.add('hidden');
+    $('exam').classList.remove('hidden');
+    setCameraStatus('Camera enabled. Waiting for teacher connection...');
+    startSignalling();
+    installActivityLogging();
+    draw();
+    interval = setInterval(() => {
+      if (finished) return;
+      left = Math.max(0, left - 1);
+      $('timer').textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+      if (left <= 0) submit(true);
+    }, 1000);
+  } catch (error) {
+    $('cerr').textContent = `${error.message} Allow camera access and use HTTPS.`;
+    $('enable').disabled = false;
   }
 };
 
-// SAMPLE QUESTIONS
-$("defaults").onclick = async () => {
-  try {
-    const d = await req("/api/teacher/use-default-questions", {
-      method: "POST",
-      body: "{}"
-    });
-
-    $("pdfMsg").textContent =
-      `Loaded ${d.count} sample questions.`;
-
-    await refreshQuestionSet();
-  } catch (e) {
-    $("pdfMsg").textContent = e.message;
-  }
-};
-
-// CREATE EXAM CODE
-$("make").onclick = async () => {
-  try {
-    const durationMinutes = Number($("duration").value);
-    const questionCount = Number($("questionCountInput").value);
-
-    if (!loadedCount) {
-      throw Error("Load questions before creating an exam.");
-    }
-
-    const d = await req("/api/teacher/codes", {
-      method: "POST",
-      body: JSON.stringify({
-        student: $("student").value.trim() || "Student",
-        durationMinutes,
-        questionCount
-      })
-    });
-
-    $("codeOut").textContent =
-      `EXAM CODE: ${d.code}\n` +
-      `Student: ${d.student}\n` +
-      `Questions: ${d.questionCount}\n` +
-      `Duration: ${d.durationMinutes} minutes\n` +
-      `Expires: ${new Date(d.expires).toLocaleString()}\n` +
-      `Share this code with the student.`;
-
-    await load();
-  } catch (e) {
-    $("codeOut").textContent = e.message;
-  }
-};
-
-// ATTEMPTS
-async function load() {
-  if (loading) return;
-
-  loading = true;
-
-  try {
-    const list = await req("/api/teacher/attempts");
-
-    $("attempts").replaceChildren();
-
-    if (!list.length) {
-      $("attempts").textContent = "No attempts yet.";
-    }
-
-    for (const a of list) {
-      const card = document.createElement("div");
-      card.className = "attempt";
-
-      const info = document.createElement("span");
-      const b = document.createElement("b");
-      b.textContent = a.student || "Student";
-
-      const small = document.createElement("small");
-      small.textContent =
-        ` #${a.id} · ${a.status} · ` +
-        `${a.started ? new Date(a.started).toLocaleString() : ""} · ` +
-        `${a.duration_minutes || 60} min`;
-
-      info.append(b, document.createElement("br"), small);
-
-      const act = document.createElement("span");
-
-      if (a.result) {
-        act.textContent =
-          `${a.result.correct}/${a.result.total} · ` +
-          `${a.result.percentage}% `;
-      }
-
-      const btn = document.createElement("button");
-      btn.textContent = "Details / Monitor";
-      btn.onclick = () => detail(a.id);
-
-      act.append(btn);
-      card.append(info, act);
-      $("attempts").append(card);
-    }
-  } catch (e) {
-    $("attempts").textContent = e.message;
-  } finally {
-    loading = false;
-  }
-}
-
-function addText(parent, tag, value) {
-  const el = document.createElement(tag);
-  el.textContent = String(value ?? "");
-  parent.append(el);
-}
-
-// ATTEMPT REPORT
-async function detail(id) {
-  try {
-    const a = await req(`/api/teacher/attempts/${id}`);
-
-    $("detail").classList.remove("hidden");
-
-    const r = $("report");
-    r.replaceChildren();
-
-    addText(r, "h2", `${a.student} — Attempt ${a.id}`);
-    addText(r, "p", `Status: ${a.status}`);
-
-    addText(r, "h3", "Activity log");
-
-    (a.logs || []).forEach(x => {
-      addText(
-        r,
-        "p",
-        `${x.at} — ${x.event}: ${x.details || ""}`
-      );
-    });
-
-    if (a.result) {
-      addText(
-        r,
-        "h3",
-        `Score ${a.result.correct}/${a.result.total} · ${a.result.percentage}%`
-      );
-
-      addText(
-        r,
-        "p",
-        `Wrong: ${a.result.wrong} · Unanswered: ${a.result.unanswered}`
-      );
-
-      for (const q of a.result.review || []) {
-        addText(r, "h4", `Q${q.id}. ${q.question}`);
-
-        addText(
-          r,
-          "p",
-          `Student: ${
-            q.chosen === null
-              ? "Unanswered"
-              : q.options[q.chosen]
-          }`
-        );
-
-        addText(
-          r,
-          "p",
-          `Correct: ${q.options[q.answer]}`
-        );
-      }
-    }
-
-    connectMonitor(id);
-  } catch (e) {
-    $("live").textContent = e.message;
-  }
-}
-
-// CLEAN UP WEBRTC
-function stopMonitor() {
-  if (sock) {
-    sock.removeAllListeners();
-    sock.disconnect();
-    sock = null;
-  }
-
+// Direct peer-to-peer WebRTC: STUN only, deliberately no TURN server.
+function resetPeer() {
   if (pc) {
-    pc.ontrack = null;
     pc.onicecandidate = null;
     pc.onconnectionstatechange = null;
     pc.oniceconnectionstatechange = null;
     pc.close();
     pc = null;
   }
-
   pendingIce = [];
   remoteDescriptionReady = false;
-  activeAttemptId = null;
-  $("video").srcObject = null;
 }
-
-// LIVE CAMERA MONITORING
-function connectMonitor(id) {
-  stopMonitor();
-
-  activeAttemptId = id;
-
-  const video = $("video");
-  const live = $("live");
-
-  video.srcObject = null;
-  live.textContent = "Connecting to student...";
-
-  sock = io({
-    reconnection: true
-  });
-
+function createPeer() {
   pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" }
-    ]
+    iceServers:[{ urls:'stun:stun.l.google.com:19302' }],
+    iceCandidatePoolSize:4
   });
-
   pendingIce = [];
   remoteDescriptionReady = false;
-
-  pc.ontrack = async event => {
-    let stream = event.streams && event.streams[0];
-
-    // Some peers may deliver a track without a stream.
-    if (!stream && event.track) {
-      stream = new MediaStream([event.track]);
-    }
-
-    if (!stream) {
-      live.textContent =
-        "A camera track arrived, but no media stream was available.";
-      return;
-    }
-
-    video.srcObject = stream;
-
-    live.textContent = "Camera stream received. Starting playback...";
-
-    try {
-      await video.play();
-
-      if (video.videoWidth > 0 && video.videoHeight > 0) {
-        live.textContent =
-          `Live camera preview playing (${video.videoWidth} × ${video.videoHeight}).`;
-      } else {
-        live.textContent =
-          "Stream received. Waiting for video frames...";
-      }
-    } catch (err) {
-      console.error("Video playback error:", err);
-
-      live.textContent =
-        "Stream received, but playback did not start. Press Play on the video.";
-    }
-  };
-
-  video.onloadedmetadata = async () => {
-    try {
-      await video.play();
-
-      if (video.videoWidth > 0) {
-        live.textContent =
-          `Live camera preview playing (${video.videoWidth} × ${video.videoHeight}).`;
-      }
-    } catch (err) {
-      live.textContent =
-        "Video metadata received. Click Play if playback is paused.";
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    if (!pc) return;
-
-    const state = pc.connectionState;
-    console.log("WebRTC connection state:", state);
-
-    if (state === "connected") {
-      live.textContent =
-        "WebRTC connected. Waiting for camera video frames...";
-    } else if (state === "connecting") {
-      live.textContent = "Establishing camera connection...";
-    } else if (state === "disconnected") {
-      live.textContent =
-        "Camera connection temporarily disconnected. Waiting to reconnect...";
-    } else if (state === "failed") {
-      live.textContent =
-        "WebRTC connection failed. Network may require a TURN server.";
-    } else if (state === "closed") {
-      live.textContent = "Camera monitoring connection closed.";
-    }
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    if (!pc) return;
-
-    console.log("ICE state:", pc.iceConnectionState);
-
-    if (pc.iceConnectionState === "failed") {
-      live.textContent =
-        "ICE connection failed. STUN alone may not work on this network; configure a TURN server.";
-    } else if (pc.iceConnectionState === "checking") {
-      live.textContent = "Checking network connection to student...";
-    }
-  };
+  stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
   pc.onicecandidate = event => {
-    if (event.candidate && sock && sock.connected) {
-      sock.emit("signal", {
-        kind: "ice",
-        data: event.candidate
-      });
-    }
+    if (event.candidate && sock?.connected) sock.emit('signal', { kind:'ice', data:event.candidate });
   };
+  pc.onconnectionstatechange = () => {
+    if (!pc || finished) return;
+    console.log('Student WebRTC state:', pc.connectionState);
+    if (pc.connectionState === 'connected') setCameraStatus('Direct WebRTC connection established.');
+    else if (pc.connectionState === 'connecting') setCameraStatus('Connecting camera directly to teacher...');
+    else if (pc.connectionState === 'disconnected') setCameraStatus('Camera connection temporarily disconnected.');
+    else if (pc.connectionState === 'failed') setCameraStatus('Direct connection failed. Try both devices on the same Wi-Fi. TURN is disabled.');
+  };
+  pc.oniceconnectionstatechange = () => {
+    if (!pc) return;
+    console.log('Student ICE state:', pc.iceConnectionState);
+    if (pc.iceConnectionState === 'checking') setCameraStatus('Checking direct network path...');
+    if (pc.iceConnectionState === 'failed') setCameraStatus('ICE failed. The network may block direct peer-to-peer connections.');
+  };
+}
 
-  sock.on("connect", () => {
-    if (activeAttemptId !== id) return;
+function startSignalling() {
+  if (sock) sock.disconnect();
+  sock = io({ reconnection:true });
 
-    live.textContent = "Signalling connected. Joining monitoring room...";
-
-    sock.emit("join-monitor", {
-      attemptId: id,
-      role: "teacher"
-    });
+  sock.on('connect', () => {
+    setCameraStatus('Signalling connected. Joining monitoring room...');
+    sock.emit('join-monitor', { attemptId:aid, role:'student', monitorToken });
   });
+  sock.on('connect_error', error => setCameraStatus(`Signalling error: ${error.message}`));
+  sock.on('monitor-error', data => setCameraStatus(data?.message || 'Camera monitoring authorization failed.'));
+  sock.on('disconnect', reason => { if (!finished) setCameraStatus(`Signalling disconnected: ${reason}`); });
+  sock.on('peer-left', peer => { if (peer?.role === 'teacher' && !finished) setCameraStatus('Teacher disconnected from camera monitoring.'); });
 
-  sock.on("connect_error", err => {
-    live.textContent =
-      "Signalling connection error: " + err.message;
-  });
-
-  sock.on("disconnect", reason => {
-    if (activeAttemptId === id) {
-      live.textContent =
-        "Signalling disconnected: " + reason;
+  sock.on('peer-ready', async peer => {
+    if (!peer || peer.role !== 'teacher' || finished) return;
+    // Do not start another offer if an offer is already in progress.
+    if (pc && pc.connectionState !== 'failed' && pc.connectionState !== 'closed' && pc.signalingState !== 'stable') return;
+    try {
+      resetPeer();
+      createPeer();
+      setCameraStatus('Teacher joined. Creating camera offer...');
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sock.emit('signal', { kind:'offer', data:pc.localDescription });
+      setCameraStatus('Camera offer sent. Establishing direct connection...');
+    } catch (error) {
+      console.error('Create offer failed:', error);
+      setCameraStatus(`Could not start camera connection: ${error.message}`);
     }
   });
 
-  sock.on("peer-ready", peer => {
-    if (!peer || peer.role !== "student") return;
-
-    live.textContent =
-      "Student is connected. Waiting for camera offer...";
-  });
-
-  sock.on("signal", async message => {
-    if (!pc || activeAttemptId !== id) return;
-    if (!message || message.from !== "student") return;
-
+  sock.on('signal', async message => {
+    if (!message || message.from !== 'teacher' || finished || !pc) return;
     try {
-      if (message.kind === "offer") {
-        live.textContent = "Receiving student camera offer...";
-
+      if (message.kind === 'answer') {
         await pc.setRemoteDescription(message.data);
         remoteDescriptionReady = true;
-
-        // Apply queued student ICE candidates.
-        while (pendingIce.length) {
-          const candidate = pendingIce.shift();
-          await pc.addIceCandidate(candidate);
-        }
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-
-        sock.emit("signal", {
-          kind: "answer",
-          data: pc.localDescription
-        });
-
-        live.textContent =
-          "Camera answer sent. Establishing media connection...";
-
-      } else if (message.kind === "ice") {
-        if (remoteDescriptionReady && pc.remoteDescription) {
-          await pc.addIceCandidate(message.data);
-        } else {
-          pendingIce.push(message.data);
-        }
+        while (pendingIce.length) await pc.addIceCandidate(pendingIce.shift());
+        setCameraStatus('Teacher answer received. Completing direct video connection...');
+      } else if (message.kind === 'ice') {
+        if (remoteDescriptionReady && pc.remoteDescription) await pc.addIceCandidate(message.data);
+        else pendingIce.push(message.data);
       }
-    } catch (err) {
-      console.error("WebRTC signalling error:", err);
-
-      live.textContent =
-        "WebRTC error: " + (err.message || "Unknown error");
+    } catch (error) {
+      console.error('Student WebRTC error:', error);
+      setCameraStatus(`WebRTC error: ${error.message}`);
     }
   });
 }
 
-// BUTTONS
-$("refresh").onclick = load;
+function installActivityLogging() {
+  if (window.examActivityLoggingInstalled) return;
+  window.examActivityLoggingInstalled = true;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      lastHiddenAt = Date.now();
+      log('visibility_hidden', 'Exam tab became hidden');
+    } else {
+      const seconds = lastHiddenAt ? Math.round((Date.now() - lastHiddenAt) / 1000) : 0;
+      log('visibility_visible', seconds ? `Returned after ${seconds} seconds` : 'Exam tab visible');
+      lastHiddenAt = 0;
+    }
+  });
+  document.addEventListener('fullscreenchange', () => log(document.fullscreenElement ? 'fullscreen_entered' : 'fullscreen_exited'));
+  window.addEventListener('offline', () => log('connection_lost', 'Browser reported offline'));
+  window.addEventListener('online', () => log('connection_restored', 'Browser reported online'));
+  document.addEventListener('copy', event => { event.preventDefault(); log('copy_attempt', 'Copy action attempted on exam page'); });
+  document.addEventListener('cut', event => { event.preventDefault(); log('cut_attempt', 'Cut action attempted on exam page'); });
+  document.addEventListener('paste', event => { event.preventDefault(); log('paste_attempt', 'Paste action attempted on exam page'); });
+  document.addEventListener('contextmenu', event => { event.preventDefault(); log('right_click', 'Context menu attempted'); });
+  document.addEventListener('keydown', event => {
+    const key = event.key.toLowerCase();
+    if ((event.ctrlKey || event.metaKey) && ['c','v','x','p','s'].includes(key)) {
+      event.preventDefault();
+      const names = { c:'copy_shortcut', v:'paste_shortcut', x:'cut_shortcut', p:'print_shortcut', s:'save_shortcut' };
+      log(names[key], `Blocked Ctrl/Cmd+${key.toUpperCase()} shortcut`);
+    }
+  });
+}
 
-$("close").onclick = () => {
-  stopMonitor();
-  $("detail").classList.add("hidden");
-  $("live").textContent = "Select an attempt to monitor.";
+function draw() {
+  if (!qs.length) return;
+  const question = qs[cur];
+  $('count').textContent = `Question ${cur + 1} / ${qs.length}`;
+  $('topic').textContent = `${question.topic || 'Question'} · ${question.difficulty || ''}`;
+  $('q').textContent = question.question;
+  $('opts').replaceChildren();
+  question.options.forEach((value, index) => {
+    const button = document.createElement('button');
+    button.className = 'option' + (ans[question.id] === index ? ' selected' : '');
+    button.textContent = `${String.fromCharCode(65 + index)}. ${value}`;
+    button.onclick = async () => {
+      ans[question.id] = index;
+      draw();
+      try { await post(`/api/student/${aid}/answer`, { questionId:question.id, answer:index }); }
+      catch (error) { console.error('Answer save failed:', error); }
+    };
+    $('opts').append(button);
+  });
+  $('palette').replaceChildren();
+  qs.forEach((q, index) => {
+    const button = document.createElement('button');
+    button.textContent = index + 1;
+    button.className = (ans[q.id] !== undefined ? 'answered ' : '') + (index === cur ? 'current' : '');
+    button.onclick = () => { cur = index; draw(); };
+    $('palette').append(button);
+  });
+  $('prev').disabled = cur === 0;
+  $('next').textContent = cur === qs.length - 1 ? 'Finish' : 'Next';
+}
+
+$('prev').onclick = () => { if (cur > 0) { cur--; draw(); } };
+$('next').onclick = () => { if (cur < qs.length - 1) { cur++; draw(); } else submit(false); };
+$('clear').onclick = async () => {
+  const question = qs[cur];
+  if (!question) return;
+  delete ans[question.id];
+  draw();
+  try { await post(`/api/student/${aid}/answer`, { questionId:question.id, answer:null }); }
+  catch (error) { console.error('Clear answer failed:', error); }
 };
+$('submit').onclick = () => submit(false);
 
-$("logout").onclick = async () => {
-  stopMonitor();
-
+async function submit(auto = false) {
+  if (finished || (!auto && !confirm('Submit your exam?'))) return;
+  finished = true;
+  $('submit').disabled = true;
+  if (interval) clearInterval(interval);
+  await log('camera_stopped', 'Camera monitoring stopped for submission');
   try {
-    await req("/api/teacher/logout", {
-      method: "POST",
-      body: "{}"
-    });
-  } catch (e) {
-    console.error("Logout error:", e);
+    const result = await post(`/api/student/${aid}/submit`, {});
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (sock) { sock.disconnect(); sock = null; }
+    resetPeer();
+    $('exam').classList.add('hidden');
+    $('done').classList.remove('hidden');
+    $('status').textContent = 'Submitted';
+    $('doneText').textContent = `Saved: ${result.correct}/${result.total} correct (${result.percentage}%). Your teacher can see the detailed report.`;
+  } catch (error) {
+    finished = false;
+    $('submit').disabled = false;
+    alert(error.message);
+    interval = setInterval(() => {
+      if (finished) return;
+      left = Math.max(0, left - 1);
+      $('timer').textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+      if (left <= 0) submit(true);
+    }, 1000);
   }
-
-  location.reload();
-};
-
-checkLogin();
+}
 </script>
 </body>
 </html>
