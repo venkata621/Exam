@@ -190,20 +190,16 @@ function cleanQuestion(q, index) {
 }
 
 /*
- Supported question format:
+  PDF parser for numbered MCQs.
 
- 1. What is Python?
- A) Option one
- B) Option two
- C) Option three
- D) Option four
- Answer: B
+  Supported example:
 
- Also attempts to support answer keys such as:
- 1-B, 2-C, 3-A
-
- Scanned/image PDFs require OCR and are not supported by this
- text extraction function.
+  Q1. [Low] What is Python?
+  A) Option one
+  B) Option two
+  C) Option three
+  D) Option four
+  Answer: A (Low)
 */
 
 function parseQuestionsFromPdfText(rawText) {
@@ -213,159 +209,128 @@ function parseQuestionsFromPdfText(rawText) {
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n");
 
-  const answerKey = new Map();
-
-  const keyStart = text.match(
-    /(?:answer\s*key|answers\s*key|correct\s*answers)\s*[:\-]?\s*/i
-  );
-
-  if (keyStart) {
-    const keyText = text.slice(keyStart.index + keyStart[0].length);
-
-    const keyRegex =
-      /(?:^|[\s,;|])(?:Q\s*)?(\d{1,3})\s*[.)\-:]?\s*([A-D])\b/gi;
-
-    for (const match of keyText.matchAll(keyRegex)) {
-      answerKey.set(
-        Number(match[1]),
-        match[2].toUpperCase().charCodeAt(0) - 65
-      );
-    }
-  }
-
-  const startRegex =
+  // Find headings such as Q1., Q2., Question 1., or 1.
+  const questionRegex =
     /(?:^|\n)\s*(?:Q(?:uestion)?\s*)?(\d{1,3})\s*[.)]\s*/gim;
 
-  const starts = [...text.matchAll(startRegex)];
-  const chunks = [];
+  const starts = [...text.matchAll(questionRegex)];
+  const questions = [];
 
   for (let i = 0; i < starts.length; i++) {
     const match = starts[i];
+
     const start =
       match.index + (match[0].startsWith("\n") ? 1 : 0);
+
     const end =
-      i + 1 < starts.length ? starts[i + 1].index : text.length;
+      i + 1 < starts.length
+        ? starts[i + 1].index
+        : text.length;
 
-    chunks.push({
-      number: Number(match[1]),
-      text: text.slice(start, end).trim()
-    });
-  }
-
-  const questions = [];
-
-  for (const item of chunks) {
-    let chunk = item.text;
+    let chunk = text.slice(start, end).trim();
 
     chunk = chunk.replace(
-      /\n\s*(?:answer\s*key|answers\s*key|correct\s*answers)\b[\s\S]*$/i,
+      /^(?:Q(?:uestion)?\s*)?\d{1,3}\s*[.)]\s*/i,
       ""
     );
 
-    const answerMatch =
-      chunk.match(
-        /(?:correct\s+)?answer\s*[:=\-]\s*([A-D]|[1-4])\b/i
-      ) ||
-      chunk.match(
-        /\bAns\.?\s*[:=\-]\s*([A-D]|[1-4])\b/i
-      );
+    const difficultyMatch =
+      chunk.match(/^\[(Low|Medium|Hard)\]\s*/i);
 
-    /*
-     Supports option labels:
-     A) Option
-     A. Option
-     A: Option
-     (A) Option
+    const difficulty = difficultyMatch
+      ? difficultyMatch[1]
+      : "Medium";
 
-     Labels are detected at line starts or after spacing.
-    */
+    chunk = chunk.replace(
+      /^\[(?:Low|Medium|Hard)\]\s*/i,
+      ""
+    );
+
+    // Answers like "Answer: A (Low)".
+    const answerMatch = chunk.match(
+      /(?:correct\s+)?answer\s*[:=\-]\s*([A-D])\b/i
+    );
+
+    if (!answerMatch) continue;
+
+    const answer =
+      answerMatch[1].toUpperCase().charCodeAt(0) - 65;
+
+    // Recognize A), B), A., B., A:, and (A).
     const optionRegex =
-      /(?:^|\n|\s{2,})\(?([A-D])\)?\s*[.):]\s+/gim;
+      /(?:^|\n)\s*(?:\(([A-D])\)|([A-D])\s*[).:])\s*/gim;
 
-    const allOptionMatches = [...chunk.matchAll(optionRegex)];
-    const optionMatches = [];
-    const seen = new Set();
+    const optionMatches = [...chunk.matchAll(optionRegex)];
+    const optionMap = new Map();
 
-    for (const match of allOptionMatches) {
-      const letter = match[1].toUpperCase();
+    for (let j = 0; j < optionMatches.length; j++) {
+      const current = optionMatches[j];
+      const label = (current[1] || current[2]).toUpperCase();
 
-      if (!seen.has(letter)) {
-        seen.add(letter);
-        optionMatches.push(match);
-      }
+      if (optionMap.has(label)) continue;
 
-      if (optionMatches.length === 4) break;
-    }
+      const valueStart = current.index + current[0].length;
 
-    if (optionMatches.length < 2) continue;
-
-    const first = optionMatches[0];
-    const firstLabelPos = first[0].search(/\(?[A-D]\)?\s*[.):]/i);
-
-    const questionText = chunk
-      .slice(0, first.index + Math.max(0, firstLabelPos))
-      .replace(/^\s*(?:Q(?:uestion)?\s*)?\d{1,3}\s*[.)]\s*/i, "")
-      .trim();
-
-    const options = [];
-
-    for (let i = 0; i < optionMatches.length; i++) {
-      const match = optionMatches[i];
-      const labelPos = match[0].search(/\(?[A-D]\)?\s*[.):]/i);
-
-      const valueStart =
-        match.index + labelPos +
-        match[0].slice(labelPos).length;
-
-      const next = optionMatches[i + 1];
+      const next = optionMatches[j + 1];
       const valueEnd = next ? next.index : chunk.length;
 
       let value = chunk.slice(valueStart, valueEnd).trim();
 
       value = value.replace(
-        /\n?\s*(?:correct\s+)?answer\s*[:=\-].*$/is,
+        /\n?\s*(?:correct\s+)?answer\s*[:=\-][\s\S]*$/i,
         ""
-      );
+      ).trim();
 
       value = value.replace(
-        /\n?\s*(?:explanation|solution)\s*[:=\-].*$/is,
+        /\n?\s*(?:explanation|solution)\s*[:=\-][\s\S]*$/i,
         ""
-      );
+      ).trim();
 
-      if (value) options.push(value);
+      if (value) {
+        optionMap.set(label, value);
+      }
     }
 
-    let answer = -1;
+    const labels = ["A", "B", "C", "D"];
 
-    if (answerMatch) {
-      const value = answerMatch[1].toUpperCase();
-
-      answer = /^[A-D]$/.test(value)
-        ? value.charCodeAt(0) - 65
-        : Number(value) - 1;
-    } else if (answerKey.has(item.number)) {
-      answer = answerKey.get(item.number);
+    // Only accept a question when all four options are present.
+    if (!labels.every(label => optionMap.has(label))) {
+      continue;
     }
 
-    if (
-      questionText &&
-      options.length >= 2 &&
-      answer >= 0 &&
-      answer < options.length
-    ) {
-      questions.push({
-        question: questionText,
-        options: options.slice(0, 4),
-        answer,
-        topic: "PDF Import",
-        difficulty: "Medium"
-      });
-    }
+    const firstOption = optionMatches.find(
+      item => (item[1] || item[2]).toUpperCase() === "A"
+    );
+
+    if (!firstOption) continue;
+
+    let question = chunk.slice(0, firstOption.index).trim();
+
+    question = question
+      .replace(/^\[(?:Low|Medium|Hard)\]\s*/i, "")
+      .trim();
+
+    if (!question) continue;
+
+    questions.push({
+      question,
+      options: labels.map(label => optionMap.get(label)),
+      answer,
+      topic: "Python Basics",
+      difficulty,
+      explanation: ""
+    });
   }
 
-  return questions
-    .map((q, i) => cleanQuestion(q, i))
-    .filter(Boolean);
+  return questions.map((q, index) => ({
+    id: index + 1,
+    topic: q.topic,
+    difficulty: q.difficulty,
+    question: q.question,
+    options: q.options,
+    answer: q.answer,
+    explanation: q.explanation
+  }));
 }
 
 app.get("/api/health", (req, res) => {
@@ -451,14 +416,17 @@ app.post(
       }
 
       const parsed = await pdfParse(req.file.buffer);
-      const questions = parseQuestionsFromPdfText(parsed.text || "");
+
+      const questions = parseQuestionsFromPdfText(
+        parsed.text || ""
+      );
 
       if (!questions.length) {
         return res.status(422).json({
           error:
             "No complete MCQs with answers were detected. " +
-            "Expected numbered questions, A-D options and an inline " +
-            "'Answer: B' or a numbered answer key such as '1-B, 2-C'. " +
+            "Expected numbered questions, A-D options and an " +
+            "inline answer such as 'Answer: B'. " +
             "Scanned PDFs need OCR. Check the PDF layout."
         });
       }
@@ -477,6 +445,7 @@ app.post(
           questions: questions.map(q => ({
             id: q.id,
             topic: q.topic,
+            difficulty: q.difficulty,
             question: q.question,
             options: q.options,
             answer: q.answer
@@ -521,6 +490,7 @@ app.get("/api/teacher/question-set", auth, (req, res) => {
     questions: questions.map(q => ({
       id: q.id,
       topic: q.topic,
+      difficulty: q.difficulty,
       question: q.question,
       options: q.options,
       answer: q.answer
@@ -539,7 +509,7 @@ app.post("/api/teacher/codes", auth, (req, res) => {
       });
     }
 
-    // Do not silently fall back to sample questions.
+    // Never silently use sample questions after a failed PDF import.
     const sourceQuestions = req.session.importedQuestions;
 
     if (!Array.isArray(sourceQuestions) || sourceQuestions.length === 0) {
@@ -570,6 +540,7 @@ app.post("/api/teacher/codes", auth, (req, res) => {
       .map((q, i) => ({ ...q, id: i + 1 }));
 
     const code = crypto.randomBytes(4).toString("hex").toUpperCase();
+
     const expires = new Date(
       Date.now() + 24 * 60 * 60 * 1000
     ).toISOString();
@@ -593,6 +564,7 @@ app.post("/api/teacher/codes", auth, (req, res) => {
     });
   } catch (e) {
     console.error("Create code:", e);
+
     res.status(500).json({
       error: "Could not create exam code."
     });
@@ -639,7 +611,10 @@ app.get("/api/teacher/attempts/:id", auth, (req, res) => {
 app.post("/api/student/start", (req, res) => {
   try {
     const code = String(req.body.code || "").trim().toUpperCase();
-    const row = db.prepare("SELECT * FROM codes WHERE code=?").get(code);
+
+    const row = db
+      .prepare("SELECT * FROM codes WHERE code=?")
+      .get(code);
 
     if (!row || row.used || Date.now() > Date.parse(row.expires)) {
       return res.status(400).json({
@@ -679,6 +654,7 @@ app.post("/api/student/start", (req, res) => {
     });
   } catch (e) {
     console.error(e);
+
     res.status(500).json({
       error: "Could not start exam"
     });
@@ -693,11 +669,15 @@ app.post("/api/student/:id/consent", (req, res) => {
     .get(id);
 
   if (!attempt) {
-    return res.status(404).json({ error: "Exam not active" });
+    return res.status(404).json({
+      error: "Exam not active"
+    });
   }
 
   if (req.body.consent !== true) {
-    return res.status(400).json({ error: "Consent is required" });
+    return res.status(400).json({
+      error: "Consent is required"
+    });
   }
 
   db.prepare("UPDATE attempts SET consent=? WHERE id=?").run(now(), id);
@@ -719,7 +699,9 @@ app.post("/api/student/:id/answer", (req, res) => {
     .get(id);
 
   if (!attempt) {
-    return res.status(404).json({ error: "Exam not active" });
+    return res.status(404).json({
+      error: "Exam not active"
+    });
   }
 
   const row = db
@@ -734,7 +716,9 @@ app.post("/api/student/:id/answer", (req, res) => {
   const question = questions.find(q => q.id === qid);
 
   if (!question) {
-    return res.status(400).json({ error: "Invalid question ID" });
+    return res.status(400).json({
+      error: "Invalid question ID"
+    });
   }
 
   const answers = JSON.parse(attempt.answers || "{}");
@@ -768,7 +752,9 @@ app.post("/api/student/:id/log", (req, res) => {
     .get(id);
 
   if (!attempt || attempt.status !== "in_progress") {
-    return res.status(404).json({ error: "Exam inactive" });
+    return res.status(404).json({
+      error: "Exam inactive"
+    });
   }
 
   const allowed = [
