@@ -1,22 +1,24 @@
 {
-  "name": "pytest-teacher-monitor",
-  "version": "1.0.0",
-  "private": true,
+  "name": "pytest-pdf-exam",
+  "version": "2.0.0",
+  "description": "Teacher-managed MCQ exam with PDF question import, custom duration, results and consent-based live camera",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-     "node": "22.x"
+    "node": "22.x"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^11.8.1",
-    "connect-sqlite3": "^0.9.15",
+    "connect-sqlite3": "^0.9.16",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-session": "^1.18.1",
     "helmet": "^8.0.0",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "1.1.1",
     "socket.io": "^4.8.1"
   }
 }
