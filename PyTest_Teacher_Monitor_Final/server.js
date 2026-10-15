@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS attempts (
   result TEXT,
   status TEXT DEFAULT 'in_progress',
   consent TEXT,
-  duration_minutes INTEGER DEFAULT 60
+  duration_minutes INTEGER DEFAULT 60,
+  monitor_token TEXT
 );
 
 CREATE TABLE IF NOT EXISTS logs (
@@ -86,11 +87,12 @@ function addColumnIfMissing(table, column, definition) {
 addColumnIfMissing("codes", "exam_json", "TEXT");
 addColumnIfMissing("codes", "duration_minutes", "INTEGER DEFAULT 60");
 addColumnIfMissing("attempts", "duration_minutes", "INTEGER DEFAULT 60");
+addColumnIfMissing("attempts", "monitor_token", "TEXT");
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: "1mb" }));
 
-app.use(session({
+const sessionMiddleware = session({
   name: "connect.sid",
   store: new SQLiteStore({
     db: "sessions.sqlite",
@@ -106,8 +108,10 @@ app.use(session({
     secure: "auto",
     maxAge: 8 * 60 * 60 * 1000
   }
-}));
+});
 
+app.use(sessionMiddleware);
+io.engine.use(sessionMiddleware);
 app.use(express.static(path.join(__dirname, "public")));
 
 const defaultQuestions = require("./questions.json");
@@ -190,31 +194,51 @@ function cleanQuestion(q, index) {
 }
 
 /*
-  PDF parser for numbered MCQs.
+Supported selectable-text PDF layout:
 
-  Supported example:
+Q1. [Low] What is Python?
+A) Option one
+B) Option two
+C) Option three
+D) Option four
+Answer: A (Low)
 
-  Q1. [Low] What is Python?
-  A) Option one
-  B) Option two
-  C) Option three
-  D) Option four
-  Answer: A (Low)
+Scanned PDFs require OCR.
 */
 
 function parseQuestionsFromPdfText(rawText) {
   const text = String(rawText || "")
-    .replace(/\r\n?/g, "\n")
+    .replace(/\r/g, "\n")
     .replace(/[\u00a0\u2007\u202f]/g, " ")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n");
 
-  // Find headings such as Q1., Q2., Question 1., or 1.
-  const questionRegex =
+  // Support numbered answer keys at the end of a PDF.
+  const answerKey = new Map();
+
+  const keySection = text.match(
+    /(?:answer\s*key|answers\s*key|correct\s*answers)\s*[:\-]?([\s\S]*)/i
+  );
+
+  if (keySection) {
+    const keyText = keySection[1];
+
+    for (const m of keyText.matchAll(
+      /(?:^|[\s,;|])(?:Q\s*)?(\d{1,3})\s*[.)\-:]?\s*([A-D])\b/gi
+    )) {
+      answerKey.set(
+        Number(m[1]),
+        m[2].toUpperCase().charCodeAt(0) - 65
+      );
+    }
+  }
+
+  // Split the PDF text into numbered questions.
+  const startRegex =
     /(?:^|\n)\s*(?:Q(?:uestion)?\s*)?(\d{1,3})\s*[.)]\s*/gim;
 
-  const starts = [...text.matchAll(questionRegex)];
-  const questions = [];
+  const starts = [...text.matchAll(startRegex)];
+  const chunks = [];
 
   for (let i = 0; i < starts.length; i++) {
     const match = starts[i];
@@ -227,111 +251,151 @@ function parseQuestionsFromPdfText(rawText) {
         ? starts[i + 1].index
         : text.length;
 
-    let chunk = text.slice(start, end).trim();
+    chunks.push({
+      number: Number(match[1]),
+      text: text.slice(start, end).trim()
+    });
+  }
+
+  const questions = [];
+
+  for (const item of chunks) {
+    let chunk = item.text;
 
     chunk = chunk.replace(
-      /^(?:Q(?:uestion)?\s*)?\d{1,3}\s*[.)]\s*/i,
+      /^\s*(?:Q(?:uestion)?\s*)?\d{1,3}\s*[.)]\s*/i,
       ""
     );
 
-    const difficultyMatch =
-      chunk.match(/^\[(Low|Medium|Hard)\]\s*/i);
+    const difficultyMatch = chunk.match(
+      /^\s*\[(Low|Medium|Hard)\]\s*/i
+    );
 
     const difficulty = difficultyMatch
       ? difficultyMatch[1]
       : "Medium";
 
     chunk = chunk.replace(
-      /^\[(?:Low|Medium|Hard)\]\s*/i,
+      /^\s*\[(?:Low|Medium|Hard)\]\s*/i,
       ""
     );
 
-    // Answers like "Answer: A (Low)".
-    const answerMatch = chunk.match(
-      /(?:correct\s+)?answer\s*[:=\-]\s*([A-D])\b/i
+    // Remove answer-key pages/sections from the question body.
+    chunk = chunk.replace(
+      /\n\s*(?:answer\s*key|answers\s*key|correct\s*answers)\b[\s\S]*$/i,
+      ""
     );
 
-    if (!answerMatch) continue;
+    const answerMatch =
+      chunk.match(
+        /(?:correct\s+)?answer\s*[:\-=]\s*([A-D]|[1-4])\b/i
+      ) ||
+      chunk.match(
+        /\bAns\.?\s*[:\-=]\s*([A-D]|[1-4])\b/i
+      );
 
-    const answer =
-      answerMatch[1].toUpperCase().charCodeAt(0) - 65;
-
-    // Recognize A), B), A., B., A:, and (A).
+    // Accept option labels A), A., A:, and (A).
     const optionRegex =
-      /(?:^|\n)\s*(?:\(([A-D])\)|([A-D])\s*[).:])\s*/gim;
+      /(?:^|\n|\s{2,})\(?([A-D])\)?\s*[.):]\s+/gim;
 
     const optionMatches = [...chunk.matchAll(optionRegex)];
-    const optionMap = new Map();
 
-    for (let j = 0; j < optionMatches.length; j++) {
-      const current = optionMatches[j];
-      const label = (current[1] || current[2]).toUpperCase();
+    if (optionMatches.length < 2) continue;
 
-      if (optionMap.has(label)) continue;
+    const unique = [];
+    const seen = new Set();
 
-      const valueStart = current.index + current[0].length;
+    for (const match of optionMatches) {
+      const letter = match[1].toUpperCase();
 
-      const next = optionMatches[j + 1];
+      if (!seen.has(letter)) {
+        seen.add(letter);
+        unique.push(match);
+      }
+
+      if (unique.length === 4) break;
+    }
+
+    if (unique.length < 2) continue;
+
+    const first = unique[0];
+
+    let questionText = chunk
+      .slice(0, first.index)
+      .trim();
+
+    questionText = questionText
+      .replace(/^\s*(?:Q(?:uestion)?\s*)?\d{1,3}\s*[.)]\s*/i, "")
+      .trim();
+
+    const options = [];
+
+    for (let i = 0; i < unique.length; i++) {
+      const match = unique[i];
+
+      const labelPosition = match[0].search(
+        /\(?[A-D]\)?\s*[.):]/i
+      );
+
+      const valueStart =
+        match.index +
+        labelPosition +
+        match[0].slice(labelPosition).length;
+
+      const next = unique[i + 1];
       const valueEnd = next ? next.index : chunk.length;
 
       let value = chunk.slice(valueStart, valueEnd).trim();
 
       value = value.replace(
-        /\n?\s*(?:correct\s+)?answer\s*[:=\-][\s\S]*$/i,
+        /\n?\s*(?:correct\s+)?answer\s*[:\-=].*$/is,
         ""
       ).trim();
 
       value = value.replace(
-        /\n?\s*(?:explanation|solution)\s*[:=\-][\s\S]*$/i,
+        /\n?\s*(?:explanation|solution)\s*[:\-=].*$/is,
         ""
       ).trim();
 
-      if (value) {
-        optionMap.set(label, value);
-      }
+      if (value) options.push(value);
     }
 
-    const labels = ["A", "B", "C", "D"];
+    let answer = -1;
 
-    // Only accept a question when all four options are present.
-    if (!labels.every(label => optionMap.has(label))) {
-      continue;
+    if (answerMatch) {
+      const answerValue = answerMatch[1].toUpperCase();
+
+      answer = /^[A-D]$/.test(answerValue)
+        ? answerValue.charCodeAt(0) - 65
+        : Number(answerValue) - 1;
+    } else if (answerKey.has(item.number)) {
+      answer = answerKey.get(item.number);
     }
 
-    const firstOption = optionMatches.find(
-      item => (item[1] || item[2]).toUpperCase() === "A"
-    );
-
-    if (!firstOption) continue;
-
-    let question = chunk.slice(0, firstOption.index).trim();
-
-    question = question
-      .replace(/^\[(?:Low|Medium|Hard)\]\s*/i, "")
-      .trim();
-
-    if (!question) continue;
-
-    questions.push({
-      question,
-      options: labels.map(label => optionMap.get(label)),
-      answer,
-      topic: "Python Basics",
-      difficulty,
-      explanation: ""
-    });
+    if (
+      questionText &&
+      options.length >= 2 &&
+      answer >= 0 &&
+      answer < options.length
+    ) {
+      questions.push({
+        question: questionText,
+        options: options.slice(0, 4),
+        answer,
+        topic: "PDF Import",
+        difficulty
+      });
+    }
   }
 
-  return questions.map((q, index) => ({
-    id: index + 1,
-    topic: q.topic,
-    difficulty: q.difficulty,
-    question: q.question,
-    options: q.options,
-    answer: q.answer,
-    explanation: q.explanation
-  }));
+  return questions
+    .map((q, i) => cleanQuestion(q, i))
+    .filter(Boolean);
 }
+
+// --------------------------------------------------
+// HEALTH AND TEACHER LOGIN
+// --------------------------------------------------
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true });
@@ -380,7 +444,10 @@ app.post("/api/teacher/login", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Login failed" });
+
+    res.status(500).json({
+      error: "Login failed"
+    });
   }
 });
 
@@ -402,6 +469,10 @@ app.post("/api/teacher/logout", auth, (req, res) => {
     res.json({ ok: true });
   });
 });
+
+// --------------------------------------------------
+// PDF UPLOAD AND QUESTION SET
+// --------------------------------------------------
 
 app.post(
   "/api/teacher/upload-pdf",
@@ -425,9 +496,8 @@ app.post(
         return res.status(422).json({
           error:
             "No complete MCQs with answers were detected. " +
-            "Expected numbered questions, A-D options and an " +
-            "inline answer such as 'Answer: B'. " +
-            "Scanned PDFs need OCR. Check the PDF layout."
+            "Use a selectable-text PDF with numbered questions, " +
+            "A-D options, and an inline answer or numbered answer key."
         });
       }
 
@@ -457,8 +527,7 @@ app.post(
 
       res.status(500).json({
         error:
-          "Could not read this PDF. It may be scanned, " +
-          "password-protected or unsupported."
+          "Could not read this PDF. It may be scanned or password-protected."
       });
     }
   }
@@ -490,13 +559,16 @@ app.get("/api/teacher/question-set", auth, (req, res) => {
     questions: questions.map(q => ({
       id: q.id,
       topic: q.topic,
-      difficulty: q.difficulty,
       question: q.question,
       options: q.options,
       answer: q.answer
     }))
   });
 });
+
+// --------------------------------------------------
+// CREATE EXAM CODE
+// --------------------------------------------------
 
 app.post("/api/teacher/codes", auth, (req, res) => {
   try {
@@ -509,14 +581,13 @@ app.post("/api/teacher/codes", auth, (req, res) => {
       });
     }
 
-    // Never silently use sample questions after a failed PDF import.
+    // Do not silently load sample questions after a failed PDF import.
     const sourceQuestions = req.session.importedQuestions;
 
-    if (!Array.isArray(sourceQuestions) || sourceQuestions.length === 0) {
+    if (!Array.isArray(sourceQuestions) || !sourceQuestions.length) {
       return res.status(400).json({
         error:
-          "No questions imported. Upload a PDF successfully or " +
-          "click 'Use sample questions.json instead'."
+          "No questions imported. Upload a PDF or explicitly choose sample questions."
       });
     }
 
@@ -571,6 +642,10 @@ app.post("/api/teacher/codes", auth, (req, res) => {
   }
 });
 
+// --------------------------------------------------
+// TEACHER ATTEMPTS AND RESULTS
+// --------------------------------------------------
+
 app.get("/api/teacher/attempts", auth, (req, res) => {
   try {
     const attempts = db
@@ -580,6 +655,8 @@ app.get("/api/teacher/attempts", auth, (req, res) => {
 
     res.json(attempts);
   } catch (e) {
+    console.error(e);
+
     res.status(500).json({
       error: "Could not load attempts"
     });
@@ -608,6 +685,10 @@ app.get("/api/teacher/attempts/:id", auth, (req, res) => {
   });
 });
 
+// --------------------------------------------------
+// STUDENT START EXAM
+// --------------------------------------------------
+
 app.post("/api/student/start", (req, res) => {
   try {
     const code = String(req.body.code || "").trim().toUpperCase();
@@ -628,9 +709,18 @@ app.post("/api/student/start", (req, res) => {
 
     const duration = Number(row.duration_minutes || 60);
 
+    // Unique token authorizes the student monitoring socket for this attempt.
+    const monitorToken = crypto.randomBytes(24).toString("hex");
+
     const insert = db.prepare(
-      "INSERT INTO attempts (code,student,started,status,duration_minutes) VALUES (?,?,?,'in_progress',?)"
-    ).run(code, row.student, now(), duration);
+      "INSERT INTO attempts (code,student,started,status,duration_minutes,monitor_token) VALUES (?,?,?,'in_progress',?,?)"
+    ).run(
+      code,
+      row.student,
+      now(),
+      duration,
+      monitorToken
+    );
 
     db.prepare("UPDATE codes SET used=1 WHERE code=?").run(code);
 
@@ -640,6 +730,7 @@ app.post("/api/student/start", (req, res) => {
 
     res.json({
       id: attemptId,
+      monitorToken,
       student: row.student,
       durationMinutes: duration,
       questions: examQuestions.map(
@@ -661,6 +752,10 @@ app.post("/api/student/start", (req, res) => {
   }
 });
 
+// --------------------------------------------------
+// STUDENT CONSENT
+// --------------------------------------------------
+
 app.post("/api/student/:id/consent", (req, res) => {
   const id = Number(req.params.id);
 
@@ -680,7 +775,8 @@ app.post("/api/student/:id/consent", (req, res) => {
     });
   }
 
-  db.prepare("UPDATE attempts SET consent=? WHERE id=?").run(now(), id);
+  db.prepare("UPDATE attempts SET consent=? WHERE id=?")
+    .run(now(), id);
 
   log(
     id,
@@ -690,6 +786,10 @@ app.post("/api/student/:id/consent", (req, res) => {
 
   res.json({ ok: true });
 });
+
+// --------------------------------------------------
+// SAVE STUDENT ANSWER
+// --------------------------------------------------
 
 app.post("/api/student/:id/answer", (req, res) => {
   const id = Number(req.params.id);
@@ -704,13 +804,15 @@ app.post("/api/student/:id/answer", (req, res) => {
     });
   }
 
-  const row = db
-    .prepare("SELECT exam_json FROM codes WHERE code=?")
-    .get(attempt.code);
+  const questions = (() => {
+    const row = db
+      .prepare("SELECT exam_json FROM codes WHERE code=?")
+      .get(attempt.code);
 
-  const questions = row && row.exam_json
-    ? JSON.parse(row.exam_json)
-    : defaultQuestions;
+    return row && row.exam_json
+      ? JSON.parse(row.exam_json)
+      : defaultQuestions;
+  })();
 
   const qid = Number(req.body.questionId);
   const question = questions.find(q => q.id === qid);
@@ -743,6 +845,10 @@ app.post("/api/student/:id/answer", (req, res) => {
 
   res.json({ ok: true });
 });
+
+// --------------------------------------------------
+// STUDENT ACTIVITY LOGS
+// --------------------------------------------------
 
 app.post("/api/student/:id/log", (req, res) => {
   const id = Number(req.params.id);
@@ -788,8 +894,13 @@ app.post("/api/student/:id/log", (req, res) => {
   }
 
   log(id, req.body.event, req.body.details || "");
+
   res.json({ ok: true });
 });
+
+// --------------------------------------------------
+// SUBMIT EXAM
+// --------------------------------------------------
 
 app.post("/api/student/:id/submit", (req, res) => {
   const id = Number(req.params.id);
@@ -862,53 +973,139 @@ app.post("/api/student/:id/submit", (req, res) => {
 
   db.prepare(
     "UPDATE attempts SET submitted=?,result=?,status='submitted' WHERE id=?"
-  ).run(now(), JSON.stringify(result), id);
+  ).run(
+    now(),
+    JSON.stringify(result),
+    id
+  );
 
   log(id, "exam_submitted", `${correct}/${questions.length}`);
 
   res.json(result);
 });
 
+// --------------------------------------------------
+// WEBRTC SIGNALLING
+// STUN-only: no TURN relay server is configured here.
+// --------------------------------------------------
+
 io.on("connection", socket => {
-  socket.on("join-monitor", data => {
-    if (
-      !data ||
-      !data.attemptId ||
-      !["teacher", "student"].includes(data.role)
-    ) {
-      return;
+  socket.on("join-monitor", async data => {
+    try {
+      if (
+        !data ||
+        !data.attemptId ||
+        !["teacher", "student"].includes(data.role)
+      ) {
+        return;
+      }
+
+      const id = Number(data.attemptId);
+
+      if (!Number.isInteger(id) || id < 1) return;
+
+      const attempt = db
+        .prepare(
+          "SELECT id,status,consent,monitor_token FROM attempts WHERE id=?"
+        )
+        .get(id);
+
+      if (!attempt) {
+        return socket.emit("monitor-error", {
+          message: "Attempt not found."
+        });
+      }
+
+      // Only an authenticated teacher can monitor this attempt.
+      if (data.role === "teacher") {
+        if (
+          !socket.request.session ||
+          socket.request.session.teacher !== true
+        ) {
+          return socket.emit("monitor-error", {
+            message: "Teacher login required for camera monitoring."
+          });
+        }
+      } else {
+        // Student monitoring requires consent and the attempt token.
+        if (
+          attempt.status !== "in_progress" ||
+          !attempt.consent ||
+          typeof data.monitorToken !== "string" ||
+          data.monitorToken !== attempt.monitor_token
+        ) {
+          return socket.emit("monitor-error", {
+            message:
+              "Student camera session is not authorized or consent is missing."
+          });
+        }
+      }
+
+      const room = `exam-${id}`;
+
+      socket.data.role = data.role;
+      socket.data.attemptId = id;
+
+      await socket.join(room);
+
+      // Notify peers even when the student or teacher joins first.
+      const members = await io.in(room).fetchSockets();
+
+      for (const member of members) {
+        const peer = members.find(other =>
+          other.id !== member.id &&
+          other.data.attemptId === id &&
+          other.data.role &&
+          other.data.role !== member.data.role
+        );
+
+        if (peer) {
+          member.emit("peer-ready", {
+            role: peer.data.role
+          });
+        }
+      }
+    } catch (error) {
+      console.error("join-monitor error:", error);
+
+      socket.emit("monitor-error", {
+        message: "Could not join camera monitoring room."
+      });
     }
-
-    const id = Number(data.attemptId);
-
-    if (!Number.isInteger(id) || id < 1) return;
-
-    socket.join(`exam-${id}`);
-
-    socket.data.role = data.role;
-    socket.data.attemptId = id;
-
-    socket.to(`exam-${id}`).emit("peer-ready", {
-      role: data.role
-    });
   });
 
   socket.on("signal", payload => {
+    const id = socket.data.attemptId;
+    const role = socket.data.role;
+
     if (
+      !id ||
+      !["teacher", "student"].includes(role) ||
       !payload ||
-      !socket.data.attemptId ||
       !["offer", "answer", "ice"].includes(payload.kind)
     ) {
       return;
     }
 
-    socket.to(`exam-${socket.data.attemptId}`).emit("signal", {
+    socket.to(`exam-${id}`).emit("signal", {
       kind: payload.kind,
       data: payload.data,
-      from: socket.data.role
+      from: role
     });
   });
+
+  socket.on("disconnect", () => {
+    if (socket.data.attemptId) {
+      socket.to(`exam-${socket.data.attemptId}`).emit("peer-left", {
+        role: socket.data.role || "peer"
+      });
+    }
+  });
 });
+
+// --------------------------------------------------
+// ERROR HANDLER AND START SERVER
+// --------------------------------------------------
 
 app.use((err, req, res, next) => {
   console.error(err);
